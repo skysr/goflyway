@@ -1,514 +1,427 @@
 package main
 
 import (
-	"compress/gzip"
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	_url "net/url"
 	"os"
-	"runtime"
+	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/coyove/goflyway/cmd/goflyway/lib"
-	"github.com/coyove/goflyway/pkg/aclrouter"
-	"github.com/coyove/goflyway/pkg/config"
-	"github.com/coyove/goflyway/pkg/logg"
-	"github.com/coyove/goflyway/pkg/lru"
-	"github.com/coyove/goflyway/proxy"
-
-	"flag"
-	"fmt"
-	"io/ioutil"
-	"strings"
+	"github.com/coyove/common/sched"
+	"github.com/coyove/goflyway"
+	"github.com/coyove/goflyway/v"
+	"golang.org/x/crypto/acme/autocert"
 )
-
-var version = "__devel__"
 
 var (
-	cmdGenCA = flag.Bool("gen-ca", false, "generate certificate (ca.pem) and private key (key.pem)")
-	cmdDebug = flag.Bool("debug", false, "turn on debug mode")
-
-	// General flags
-	cmdConfig   = flag.String("c", "", "[SC] config file path")
-	cmdLogLevel = flag.String("lv", "log", "[SC] logging level: {dbg, log, warn, err, off}")
-	cmdLogFile  = flag.String("lf", "", "[SC] log to file")
-	cmdAuth     = flag.String("a", "", "[SC] proxy authentication, form: username:password (remember the colon)")
-	cmdKey      = flag.String("k", "0123456789abcdef", "[SC] password, do not use the default one")
-	cmdLocal    = flag.String("l", ":8100", "[SC] local listening address")
-	cmdTimeout  = flag.Int64("t", 20, "[SC] close connections when they go idle for at least N sec")
-	cmdSection  = flag.String("y", "default", "[SC] section to read in the config")
-
-	// Server flags
-	cmdThrot     = flag.Int64("throt", 0, "[S] traffic throttling in bytes")
-	cmdThrotMax  = flag.Int64("throt-max", 1024*1024, "[S] traffic throttling token bucket max capacity")
-	cmdDiableUDP = flag.Bool("disable-udp", false, "[S] disable UDP relay")
-	cmdProxyPass = flag.String("proxy-pass", "", "[S] use goflyway as a reverse HTTP proxy")
-	cmdWSCBClose = flag.Int64("wscb-timeout", 200, "[S] timeout for WebSocket callback")
-	cmdAnswer    = flag.String("answer", "", "[S] answer client config setup")
-
-	// Client flags
-	cmdGlobal     = flag.Bool("g", false, "[C] global proxy")
-	cmdUpstream   = flag.String("up", "", "[C] upstream server address")
-	cmdPartial    = flag.Bool("partial", false, "[C] partially encrypt the tunnel traffic")
-	cmdUDPonTCP   = flag.Int64("udp-tcp", 1, "[C] use N TCP connections to relay UDP")
-	cmdWebConPort = flag.Int64("web-port", 65536, "[C] web console listening port, 0 to disable, 65536 to auto select")
-	cmdDNSCache   = flag.Int64("dns-cache", 1024, "[C] DNS cache size")
-	cmdMux        = flag.Int64("mux", 0, "[C] limit the total number of TCP connections, 0 means no limit")
-	cmdVPN        = flag.Bool("vpn", false, "[C] vpn mode, used on Android only")
-	cmdACL        = flag.String("acl", "chinalist.txt", "[C] load ACL file")
-	cmdMITMDump   = flag.String("mitm-dump", "", "[C] dump HTTPS requests to file")
-	cmdWSCB       = flag.Bool("wscb", false, "[C] enable WebSocket callback in MITM")
-	cmdRemote     = flag.Bool("remote", false, "[C] get config setup from the upstream")
-
-	// curl flags
-	cmdVerbose    = flag.Bool("v", false, "[Cu] verbose output")
-	cmdForm       = flag.String("F", "", "[Cu] post form")
-	cmdHeaders    = flag.String("H", "", "[Cu] headers")
-	cmdCookie     = flag.String("C", "", "[Cu] cookies")
-	cmdMultipart  = flag.Bool("M", false, "[Cu] multipart")
-	cmdPrettyJSON = flag.Bool("pj", false, "[Cu] JSON pretty output")
-
-	// Shadowsocks compatible flags
-	cmdLocal2 = flag.String("p", "", "server listening address")
-
-	_ = flag.Bool("u", true, "placeholder")
-	_ = flag.String("m", "", "placeholder")
-	_ = flag.String("b", "", "placeholder")
-	_ = flag.Bool("V", true, "placeholder")
-	_ = flag.Bool("fast-open", true, "placeholder")
+	version      = "__devel__"
+	remoteAddr   string
+	localAddr    string
+	addr         string
+	httpsProxy   string
+	resetTraffic bool
+	cconfig      = &goflyway.ClientConfig{}
+	sconfig      = &goflyway.ServerConfig{}
 )
 
-func loadConfig() {
-	path := *cmdConfig
-	if path == "" {
-		if runtime.GOOS == "windows" {
-			path = os.Getenv("USERPROFILE") + "/gfw.conf"
-		} else {
-			path = os.Getenv("HOME") + "/gfw.conf"
-		}
+func printHelp(a ...interface{}) {
+	if len(a) > 0 {
+		fmt.Printf("goflyway: ")
+		fmt.Println(a...)
 	}
-
-	if _, err := os.Stat(path); err != nil {
-		return
-	}
-
-	buf, err := ioutil.ReadFile(path)
-	if err != nil {
-		lib.Println("can't load config file:", err)
-		return
-	}
-
-	if strings.Contains(path, "shadowsocks.conf") {
-		cmds := make(map[string]interface{})
-		if err := json.Unmarshal(buf, &cmds); err != nil {
-			lib.Println("can't parse config file:", err)
-			return
-		}
-
-		*cmdKey = cmds["password"].(string)
-		*cmdUpstream = fmt.Sprintf("%v:%v", cmds["server"], cmds["server_port"])
-		if port := int(cmds["server_port"].(float64)); port > 50000 {
-			*cmdRemote = true
-			*cmdUpstream = fmt.Sprintf("%v:%v", cmds["server"], port-50000)
-		}
-		*cmdMux = 10
-		*cmdLogLevel = "dbg"
-		*cmdVPN = true
-		*cmdGlobal = true
-		return
-	}
-
-	cf, err := config.ParseConf(string(buf))
-	if err != nil {
-		lib.Println("can't parse config file:", err)
-		return
-	}
-
-	lib.Println("reading config section:", *cmdSection)
-	func(args ...interface{}) {
-		for i := 0; i < len(args); i += 2 {
-			switch f, name := args[i+1], strings.TrimSpace(args[i].(string)); f.(type) {
-			case *string:
-				*f.(*string) = cf.GetString(*cmdSection, name, *f.(*string))
-			case *int64:
-				*f.(*int64) = cf.GetInt(*cmdSection, name, *f.(*int64))
-			case *bool:
-				*f.(*bool) = cf.GetBool(*cmdSection, name, *f.(*bool))
-			}
-		}
-	}(
-		"password   ", cmdKey,
-		"auth       ", cmdAuth,
-		"listen     ", cmdLocal,
-		"upstream   ", cmdUpstream,
-		"disableudp ", cmdDiableUDP,
-		"udptcp     ", cmdUDPonTCP,
-		"global     ", cmdGlobal,
-		"acl        ", cmdACL,
-		"partial    ", cmdPartial,
-		"wscb       ", cmdWSCB,
-		"timeout    ", cmdTimeout,
-		"mux        ", cmdMux,
-		"proxypass  ", cmdProxyPass,
-		"webconport ", cmdWebConPort,
-		"dnscache   ", cmdDNSCache,
-		"wscbtimeout", cmdWSCBClose,
-		"loglevel   ", cmdLogLevel,
-		"logfile    ", cmdLogFile,
-		"throt      ", cmdThrot,
-		"throtmax   ", cmdThrotMax,
-	)
+	fmt.Println("usage: goflyway -DLhHUvkqpPtTwWy address:port")
+	os.Exit(0)
 }
 
 func main() {
-	method, url := lib.ParseExtendedOSArgs()
-	flag.Parse()
-	lib.Slient = (method != "" && !*cmdVerbose)
-	lib.Println("goflyway (build " + version + ")")
-	loadConfig()
+	sched.Verbose = false
 
-	if *cmdGenCA {
-		lib.Println("generating CA...")
+	for i, last := 1, rune(0); i < len(os.Args); i++ {
+		p := strings.TrimLeft(os.Args[i], "-")
 
-		cert, key, err := lib.GenCA("goflyway")
-		if err != nil {
-			lib.Println(err)
-			return
-		}
-
-		err1, err2 := ioutil.WriteFile("ca.pem", cert, 0755), ioutil.WriteFile("key.pem", key, 0755)
-		if err1 != nil || err2 != nil {
-			lib.Println("error ca.pem:", err1)
-			lib.Println("error key.pem:", err2)
-			return
-		}
-
-		lib.Println("successfully generated ca.pem/key.pem, please leave them in the same directory with goflyway")
-		lib.Println("goflyway will automatically read them when launched")
-		return
-	}
-
-	if *cmdUpstream != "" {
-		lib.Println("launched as client")
-	} else {
-		lib.Println("launched as server (aka upstream)")
-	}
-
-	if *cmdKey == "0123456789abcdef" {
-		lib.Println("you are using the default password, it is recommended to change it: -k=<NEW PASSWORD>")
-	}
-
-	cipher := &proxy.Cipher{Partial: *cmdPartial}
-	cipher.Init(*cmdKey)
-
-	var cc *proxy.ClientConfig
-	var sc *proxy.ServerConfig
-
-	if *cmdMux > 0 {
-		lib.Println("TCP multiplexer enabled, limit:", *cmdMux)
-	}
-
-	if *cmdUpstream != "" || *cmdDebug {
-		acl, err := aclrouter.LoadACL(*cmdACL)
-		if err != nil {
-			lib.Println("failed to read ACL config (but it's fine, you can ignore this message)")
-			lib.Println("  err:", err)
-		}
-
-		for _, r := range acl.OmitRules {
-			lib.Println("ACL omit rule:", r)
-		}
-
-		cc = &proxy.ClientConfig{}
-		cc.Cipher = cipher
-		cc.DNSCache = lru.NewCache(*cmdDNSCache)
-		cc.CACache = lru.NewCache(256)
-		cc.ACL = acl
-		cc.UserAuth = *cmdAuth
-		cc.UDPRelayCoconn = int(*cmdUDPonTCP)
-		cc.Mux = int(*cmdMux)
-		cc.Upstream = *cmdUpstream
-		parseUpstream(cc, *cmdUpstream)
-
-		if *cmdGlobal {
-			lib.Println("global proxy: goflyway will proxy everything except private IPs")
-			cc.Policy.Set(proxy.PolicyGlobal)
-		}
-
-		if *cmdWSCB {
-			cc.Policy.Set(proxy.PolicyWSCB)
-		}
-
-		if *cmdVPN {
-			cc.Policy.Set(proxy.PolicyVPN)
-		}
-
-		if *cmdMITMDump != "" {
-			cc.MITMDump, _ = os.Create(*cmdMITMDump)
-		}
-	}
-
-	if *cmdUpstream == "" || *cmdDebug {
-		sc = &proxy.ServerConfig{
-			Cipher:        cipher,
-			Throttling:    *cmdThrot,
-			ThrottlingMax: *cmdThrotMax,
-			ProxyPassAddr: *cmdProxyPass,
-			DisableUDP:    *cmdDiableUDP,
-			WSCBTimeout:   *cmdWSCBClose,
-			ClientAnswer:  *cmdAnswer,
-		}
-
-		if *cmdAuth != "" {
-			sc.Users = map[string]proxy.UserConfig{
-				*cmdAuth: {},
+		// HACK: ss-local compatible command flags
+		if p == "fast-open" || p == "V" || p == "u" || p == "m" || p == "b" {
+			if i < len(os.Args)-1 && !strings.HasPrefix(os.Args[i+1], "-") {
+				i++
 			}
-		}
-	}
-
-	if *cmdLogFile != "" {
-		logg.Redirect(*cmdLogFile)
-		lib.Println("redirect log to", *cmdLogFile)
-	}
-
-	logg.SetLevel(*cmdLogLevel)
-	logg.Start()
-
-	if *cmdDebug {
-		lib.Println("debug mode on")
-
-		cc.Upstream = "127.0.0.1:8101"
-		client := proxy.NewClient(":8100", cc)
-		go func() {
-			logg.F(client.Start())
-		}()
-
-		server := proxy.NewServer(":8101", sc)
-		logg.F(server.Start())
-		return
-	}
-
-	if *cmdTimeout > 0 {
-		cipher.IO.StartPurgeConns(int(*cmdTimeout))
-	}
-
-	var localaddr string
-	if *cmdLocal2 != "" {
-		// -p has higher priority than -l, for the sack of SS users
-		localaddr = *cmdLocal2
-	} else {
-		localaddr = *cmdLocal
-	}
-
-	if *cmdUpstream != "" {
-		client := proxy.NewClient(localaddr, cc)
-
-		if *cmdRemote {
-			lib.Println("get config from the upstream")
-			cm := client.GetRemoteConfig()
-			if cm == "" {
-				logg.F("can't get remote config")
-			}
-
-			parseUpstream(cc, cm)
-			client = proxy.NewClient(localaddr, cc)
+			continue
 		}
 
-		if method != "" {
-			curl(client, method, url, nil)
-		} else {
-			if *cmdWebConPort != 0 {
-				go func() {
-					addr := fmt.Sprintf("127.0.0.1:%d", *cmdWebConPort)
-					if *cmdWebConPort == 65536 {
-						addr_, _ := net.ResolveTCPAddr("tcp", client.Localaddr)
-						addr = fmt.Sprintf("127.0.0.1:%d", addr_.Port+10)
+		if len(p) != len(os.Args[i]) {
+			for i, c := range p {
+				switch c {
+				case 'h':
+					printHelp()
+				//case 'V':
+				//	printHelp(version)
+				case 'L', 'P', 'p', 'k', 't', 'T', 'W', 'H', 'U', 'D', 'c':
+					last = c
+				case 'v':
+					v.Verbose++
+				case 'q':
+					v.Verbose = -1
+				case 'w':
+					cconfig.WebSocket = true
+				case 'y':
+					resetTraffic = true
+				case '=':
+					i++
+					fallthrough
+				default:
+					if last == 0 {
+						printHelp("illegal option --", string(c))
 					}
-
-					http.HandleFunc("/", lib.WebConsoleHTTPHandler(client))
-					lib.Println("access client web console at [", addr, "]")
-					logg.F(http.ListenAndServe(addr, nil))
-				}()
+					p = p[i:]
+					goto PARSE
+				}
 			}
-
-			lib.Println("proxy", client.Cipher.Alias, "started at [", client.Localaddr, "], upstream: [", client.Upstream, "]")
-			logg.F(client.Start())
+			continue
 		}
+	PARSE:
+		if strings.HasPrefix(p, "\"") {
+			if p, _ = strconv.Unquote(p); p == "" {
+				printHelp("illegal option --", string(last))
+			}
+		}
+		switch last {
+		case 'D':
+			cconfig.Dynamic = true
+			fallthrough
+		case 'L':
+			switch parts := strings.Split(p, ":"); len(parts) {
+			case 1:
+				localAddr = ":" + parts[0]
+			case 2:
+				localAddr = p
+			case 3:
+				localAddr, remoteAddr = ":"+parts[0], parts[1]+":"+parts[2]
+			case 4:
+				localAddr, remoteAddr = parts[0]+":"+parts[1], parts[2]+":"+parts[3]
+			default:
+				printHelp("illegal option --", string(last), p)
+			}
+		case 'P':
+			sconfig.ProxyPassAddr = p
+		case 'U':
+			cconfig.PathPattern = p
+		case 'T':
+			speed, _ := strconv.ParseInt(p, 10, 64)
+			sconfig.SpeedThrot = goflyway.NewTokenBucket(speed, speed*25)
+		case 'W':
+			writebuffer, _ := strconv.ParseInt(p, 10, 64)
+			sconfig.WriteBuffer, cconfig.WriteBuffer = writebuffer, writebuffer
+		case 't':
+			*(*int64)(&cconfig.Timeout), _ = strconv.ParseInt(p+"000000000", 10, 64)
+			sconfig.Timeout = cconfig.Timeout
+		case 'p', 'k':
+			sconfig.Key, cconfig.Key = p, p
+		case 'H':
+			cconfig.URLHeader = p
+			httpsProxy = p
+		case 'c':
+			buf, _ := ioutil.ReadFile(p)
+			cmds := make(map[string]interface{})
+			json.Unmarshal(buf, &cmds)
+			cconfig.Key, cconfig.VPN = cmds["password"].(string), true
+			addr = fmt.Sprintf("%v:%v", cmds["server"], cmds["server_port"])
+
+			v.Verbose = 3
+			v.Vprint(os.Args, " config: ", cmds)
+		default:
+			addr = p
+		}
+		last = 0
+	}
+
+	if addr == "" {
+		if localAddr == "" {
+			v.Vprint("assume you want a default server at :8100")
+			addr = ":8100"
+		} else {
+			printHelp("missing address:port to listen/connect")
+		}
+	}
+
+	if localAddr != "" && remoteAddr == "" {
+		_, port, err1 := net.SplitHostPort(localAddr)
+		host, _, err2 := net.SplitHostPort(addr)
+		remoteAddr = host + ":" + port
+		if err1 != nil || err2 != nil {
+			printHelp("invalid address --", localAddr, addr)
+		}
+	}
+
+	if localAddr != "" && remoteAddr != "" {
+		cconfig.Bind = remoteAddr
+		cconfig.Upstream = addr
+		cconfig.Stat = &goflyway.Traffic{}
+
+		if v.Verbose > 0 {
+			go watchTraffic(cconfig, resetTraffic)
+		}
+		if cconfig.Dynamic {
+			v.Vprint("dynamic: forward ", localAddr, " to * through ", addr)
+		} else {
+			v.Vprint("forward ", localAddr, " to ", remoteAddr, " through ", addr)
+		}
+		if cconfig.WebSocket {
+			v.Vprint("relay: use Websocket protocol")
+		}
+		if a := os.Getenv("http_proxy") + os.Getenv("HTTP_PROXY"); a != "" {
+			v.Vprint("note: system HTTP proxy is set to: ", a)
+		}
+		if a := os.Getenv("https_proxy") + os.Getenv("HTTPS_PROXY"); a != "" {
+			v.Vprint("note: system HTTPS proxy is set to: ", a)
+		}
+
+		v.Eprint(goflyway.NewClient(localAddr, cconfig))
+	} else if httpsProxy != "" {
+		v.Vprint("server listen on ", addr, " (https://", httpsProxy, ")")
+		m := &autocert.Manager{
+			Cache:      autocert.DirCache("secret-dir"),
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(httpsProxy),
+		}
+		s := &http.Server{
+			Addr:      addr,
+			TLSConfig: m.TLSConfig(),
+		}
+		for i, p := range s.TLSConfig.NextProtos {
+			if p == "h2" {
+				s.TLSConfig.NextProtos[i] = "h2-disabled"
+			}
+		}
+		s.Handler = &connector{
+			realm: "R" + strconv.FormatInt(time.Now().Unix(), 16),
+		}
+		v.Eprint(s.ListenAndServeTLS("", ""))
 	} else {
-		server := proxy.NewServer(localaddr, sc)
-		lib.Println("upstream", server.Cipher.Alias, "started at [", server.Localaddr, "]")
-		if strings.HasPrefix(sc.ProxyPassAddr, "http") {
-			lib.Println("alternatively act as a reverse proxy:", sc.ProxyPassAddr)
-		} else if sc.ProxyPassAddr != "" {
-			lib.Println("alternatively act as a file server:", sc.ProxyPassAddr)
-		}
-		logg.F(server.Start())
+		v.Vprint("server listen on ", addr)
+		v.Eprint(goflyway.NewServer(addr, sconfig))
 	}
 }
 
-func parseUpstream(cc *proxy.ClientConfig, upstream string) {
-	if is := func(in string) bool { return strings.HasPrefix(upstream, in) }; is("https://") {
-		cc.Connect2Auth, cc.Connect2, _, cc.Upstream = parseAuthURL(upstream)
-		lib.Println("use HTTPS proxy [", cc.Connect2, "] as the frontend, proxy auth: [", cc.Connect2Auth, "]")
+func watchTraffic(cconfig *goflyway.ClientConfig, reset bool) {
+	path := filepath.Join(os.TempDir(), "goflyway_traffic")
 
-		if cc.Mux > 0 {
-			logg.F("can't use an HTTPS proxy with TCP multiplexer")
+	tmpbuf, _ := ioutil.ReadFile(path)
+	if len(tmpbuf) != 16 || reset {
+		tmpbuf = make([]byte, 16)
+	}
+
+	cconfig.Stat.Set(int64(binary.BigEndian.Uint64(tmpbuf)), int64(binary.BigEndian.Uint64(tmpbuf[8:])))
+
+	var lastSent, lastRecv int64
+	for range time.Tick(time.Second * 5) {
+		s, r := *cconfig.Stat.Sent(), *cconfig.Stat.Recv()
+		sv, rv := float64(s-lastSent)/1024/1024/5, float64(r-lastRecv)/1024/1024/5
+		lastSent, lastRecv = s, r
+
+		if sv >= 0.001 || rv >= 0.001 {
+			v.Vprint("client send: ", float64(s)/1024/1024, "M (", sv, "M/s), recv: ", float64(r)/1024/1024, "M (", rv, "M/s)")
 		}
 
-	} else if gfw, http, ws, cf, fwd, fwdws :=
-		is("gfw://"), is("http://"), is("ws://"),
-		is("cf://"), is("fwd://"), is("fwds://"); gfw || http || ws || cf || fwd || fwdws {
+		binary.BigEndian.PutUint64(tmpbuf, uint64(s))
+		binary.BigEndian.PutUint64(tmpbuf[8:], uint64(r))
+		ioutil.WriteFile(path, tmpbuf, 0644)
+	}
+}
 
-		cc.Connect2Auth, cc.Upstream, cc.URLHeader, cc.DummyDomain = parseAuthURL(upstream)
+type connector struct {
+	realm     string
+	whitelist sync.Map
+}
 
-		switch true {
-		case cf:
-			lib.Println("connect to the upstream [", cc.Upstream, "] hosted on cloudflare")
-			cc.DummyDomain = cc.Upstream
-		case fwdws, fwd:
-			if cc.URLHeader == "" {
-				cc.URLHeader = "X-Forwarded-Url"
+func (c *connector) getClientIP(r *http.Request) string {
+	clientIP := r.Header.Get("X-Forwarded-For")
+	clientIP = strings.TrimSpace(strings.Split(clientIP, ",")[0])
+	if clientIP == "" {
+		clientIP = strings.TrimSpace(r.Header.Get("X-Real-Ip"))
+	}
+	if clientIP != "" {
+		return clientIP
+	}
+	if ip, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		return ip
+	}
+	return ""
+}
+
+func (c *connector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/"+sconfig.Key {
+		ip := r.UserAgent()
+		if ip == "" {
+			w.WriteHeader(400)
+			return
+		}
+		c.whitelist.Store(ip, true)
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+		return
+	}
+
+	plain := false
+
+	if r.URL.Hostname() == httpsProxy {
+		// we proxy the traffic to ourselves without auth
+		goto OK
+	}
+
+	if parts := strings.Split(r.Header.Get("Proxy-Authorization"), " "); len(parts) == 2 {
+		pa, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1]))
+		if string(pa) == "admin:"+sconfig.Key {
+			goto OK
+		}
+	}
+
+	if _, ok := c.whitelist.Load(r.UserAgent()); ok {
+		w.Header().Set("Proxy-Authenticate", "Basic realm="+c.realm)
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	} else {
+		w.WriteHeader(400)
+	}
+	return
+
+OK:
+	if r.Method != "CONNECT" {
+		if r.URL.Host == "" {
+			w.WriteHeader(404)
+			return
+		}
+
+		v.VVprint("plain http proxy: ", r.URL)
+		plain = true
+	}
+
+	// we are inside GFW and should pass data to upstream
+	host := r.URL.Host
+	if !regexp.MustCompile(`:\d+$`).MatchString(host) {
+		if plain {
+			host += ":80"
+		} else {
+			host += ":443"
+		}
+	}
+
+	up, err := net.DialTimeout("tcp", host, sconfig.Timeout)
+	if err != nil {
+		v.Eprint(host, err)
+		w.WriteHeader(500)
+		return
+	}
+
+	hij, _ := w.(http.Hijacker) // No HTTP2
+	proxyClient, _, err := hij.Hijack()
+	if err != nil {
+		v.Eprint(host, err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if plain {
+		req, _ := httputil.DumpRequestOut(r, false)
+		io.Copy(up, io.MultiReader(bytes.NewReader(req), r.Body))
+	} else {
+		proxyClient.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
+	}
+
+	go func() {
+		wait := make(chan bool)
+		go func() {
+			if err, to := bridge(proxyClient, up, sconfig.Timeout); err != nil {
+				v.Eprint(err)
+			} else if to {
+				v.VVprint(host, " server read timedout")
 			}
-			lib.Println("forward request to [", cc.Upstream, "], store the true URL in [",
-				cc.URLHeader+": http://"+cc.DummyDomain+"/... ]")
-		case cc.DummyDomain != "":
-			lib.Println("use dummy host [", cc.DummyDomain, "] to connect [", cc.Upstream, "]")
+			wait <- true
+		}()
+		if err, to := bridge(up, proxyClient, sconfig.Timeout); err != nil {
+			v.Eprint(err)
+		} else if to {
+			v.VVprint(host, " client read timedout")
 		}
-
-		switch true {
-		case fwdws, cf, ws:
-			cc.Policy.Set(proxy.PolicyWebSocket)
-			lib.Println("use WebSocket protocol to transfer data")
-		case fwd, http:
-			cc.Policy.Set(proxy.PolicyManInTheMiddle)
-			lib.Println("use MITM to intercept HTTPS (HTTP proxy mode only)")
-			cc.CA = lib.TryLoadCert()
+		select {
+		case <-wait:
 		}
-	}
+		proxyClient.Close()
+		up.Close()
+	}()
 }
 
-func parseAuthURL(in string) (auth string, upstream string, header string, dummy string) {
-	// <scheme>://[<username>:<password>@]<host>:<port>[/[?<header>=]<dummy_host>:<dummy_port>]
-	if idx := strings.Index(in, "://"); idx > -1 {
-		in = in[idx+3:]
-	}
-
-	if idx := strings.Index(in, "/"); idx > -1 {
-		dummy = in[idx+1:]
-		in = in[:idx]
-		if idx = strings.Index(dummy, "="); dummy[0] == '?' && idx > -1 {
-			header = dummy[1:idx]
-			dummy = dummy[idx+1:]
+func bridge(dst, src net.Conn, t time.Duration) (err error, timedout bool) {
+	buf := make([]byte, 1024*64)
+	for {
+		if t > 0 {
+			src.SetDeadline(time.Now().Add(t))
+		}
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if ne, _ := er.(net.Error); ne != nil && ne.Timeout() {
+				timedout = true
+				break
+			}
+			if er != io.EOF {
+				err = er
+			}
+			break
 		}
 	}
-
-	upstream = in
-	if idx := strings.Index(in, "@"); idx > -1 {
-		auth = in[:idx]
-		upstream = in[idx+1:]
-	}
-
-	if _, _, err := net.SplitHostPort(upstream); err != nil {
-		lib.Println("invalid upstream destination:", upstream, err)
-		os.Exit(1)
-	}
-
 	return
 }
 
-func curl(client *proxy.ProxyClient, method string, url string, cookies []*http.Cookie) {
-	req, err := http.NewRequest(method, url, nil)
-	if err != nil {
-		lib.Println("can't create the request:", err)
-		return
-	}
+func readUntil(r io.Reader, eoh string) ([]byte, error) {
+	buf, respbuf := make([]byte, 1), &bytes.Buffer{}
+	eidx, found := 0, false
 
-	if err := lib.ParseHeadersAndPostBody(*cmdHeaders, *cmdForm, *cmdMultipart, req); err != nil {
-		lib.Println("invalid headers:", err)
-		return
-	}
-
-	if len(cookies) > 0 {
-		cs := make([]string, len(cookies))
-		for i, cookie := range cookies {
-			cs[i] = cookie.Name + "=" + cookie.Value
-			lib.Println("cookie:", cookie.String())
+	for {
+		n, err := r.Read(buf)
+		if n == 1 {
+			respbuf.WriteByte(buf[0])
 		}
 
-		oc := req.Header.Get("Cookie")
-		if oc != "" {
-			oc += ";" + strings.Join(cs, ";")
-		} else {
-			oc = strings.Join(cs, ";")
-		}
-
-		req.Header.Set("Cookie", oc)
-	}
-
-	reqbuf, _ := httputil.DumpRequest(req, false)
-	lib.Println(string(reqbuf))
-
-	var totalBytes int64
-	var startTime = time.Now().UnixNano()
-	var r *lib.ResponseRecorder
-	r = lib.NewRecorder(func(bytes int64) {
-		totalBytes += bytes
-		length, _ := strconv.ParseInt(r.HeaderMap.Get("Content-Length"), 10, 64)
-		x := "\r* copy body: " + lib.PrettySize(totalBytes) + " / " + lib.PrettySize(length) + " "
-		if len(x) < 36 {
-			x += strings.Repeat(" ", 36-len(x))
-		}
-		lib.PrintInErr(x)
-	})
-
-	client.ServeHTTP(r, req)
-	cookies = append(cookies, lib.ParseSetCookies(r.HeaderMap)...)
-
-	if r.HeaderMap.Get("Content-Encoding") == "gzip" {
-		lib.Println("decoding gzip content")
-		r.Body, _ = gzip.NewReader(r.Body)
-	}
-
-	if r.Body == nil {
-		lib.Println("empty body")
-		r.Body = &lib.NullReader{}
-	}
-
-	defer r.Body.Close()
-
-	if r.IsRedir() {
-		location := r.Header().Get("Location")
-		if location == "" {
-			lib.Println("invalid redirection location")
-			return
-		}
-
-		if !strings.HasPrefix(location, "http") {
-			if strings.HasPrefix(location, "/") {
-				u, _ := _url.Parse(url)
-				location = u.Scheme + "://" + u.Host + location
-			} else {
-				idx := strings.LastIndex(url, "/")
-				location = url[:idx+1] + location
+		if buf[0] == eoh[eidx] {
+			if eidx++; eidx == len(eoh) {
+				found = true
+				break
 			}
+		} else {
+			eidx = 0
 		}
 
-		lib.Println("redirect:", location)
-		curl(client, method, location, cookies)
-	} else {
-		respbuf, _ := httputil.DumpResponse(r.Result(), false)
-		lib.Println(string(respbuf), "\n")
-
-		lib.IOCopy(os.Stdout, r, *cmdPrettyJSON)
-
-		if totalBytes > 0 {
-			lib.PrintInErr("\n")
+		if err != nil {
+			if err != io.EOF {
+				return nil, err
+			}
+			break
 		}
-
-		lib.PrintInErr("* completed in ",
-			strconv.FormatFloat(float64(time.Now().UnixNano()-startTime)/1e9, 'f', 3, 64), "s\n")
 	}
+
+	if !found {
+		return nil, fmt.Errorf("readUntil cannot find the pattern: %v", []byte(eoh))
+	}
+
+	return respbuf.Bytes(), nil
 }
